@@ -4,6 +4,7 @@ import { relative, resolve } from "pathe";
 import type { DoctorConfig, DoctorRunOptions } from "../config.js";
 import {
   defineRulePack,
+  RemovedRuntimeEvidenceActivationError,
   type Diagnostic,
   type DoctorRuleConfig,
   type FileFacts,
@@ -50,10 +51,10 @@ import {
 import { nativeMatch, sha256 } from "./utils.js";
 import { owningWorkspacePackage, packageFrameworks } from "./workspace-packages.js";
 import { doctorInternalDiagnostics } from "../internal-diagnostic-handles.js";
+import { RETIRED_DIAGNOSTIC_CODES } from "../diagnostic-constants.js";
 import { reportedDoctorRuleIds } from "../diagnostic-registry.js";
 import {
   activatingWorkspacePackages,
-  runtimeEvidenceActivation,
   evaluateRuleApplicability,
   packageRunsRuntime,
   projectWorkspacePackages,
@@ -62,6 +63,9 @@ import {
 const DEFAULT_CONFIG: DoctorConfig = {
   cache: { dir: ".vite-doctor/cache" },
 };
+
+const retiredRuleIds = new Set(Object.values(RETIRED_DIAGNOSTIC_CODES).map(({ ruleId }) => ruleId));
+const retiredRuleReason = "the retired MCP Rules moved to `npx loadsheet mcp <url>`";
 
 interface RuleRegistry {
   packs: RulePack[];
@@ -143,10 +147,7 @@ export interface ResolvedRuleOverride {
   selects: ReadonlySet<string>;
 }
 
-export async function createScanSession(
-  options: DoctorRunOptions,
-  fullRunWhen?: (project: ProjectInfo) => boolean,
-): Promise<ScanSession> {
+export async function createScanSession(options: DoctorRunOptions): Promise<ScanSession> {
   const root = resolve(options.root ?? options.project?.root ?? process.cwd());
   const timings: Record<string, number> = {};
   const phases: Record<string, number> = {};
@@ -163,8 +164,11 @@ export async function createScanSession(
     : await detectProject(root, options.framework ?? "auto", options.runtimeTarget);
   config = resolveProjectDoctorConfig(project, options.config);
   sessionBase.config = config;
-  const extensions = [...(config.extensions ?? []), ...(options.extensions ?? [])];
-  const registry = await collectRulePacks(extensions);
+  const fromConfig = config.extensions === options.config?.extensions;
+  const registry = await collectRulePacks(
+    [...(fromConfig ? [] : (config.extensions ?? [])), ...(options.extensions ?? [])],
+    fromConfig ? config.extensions : undefined,
+  );
   // A source's evidence is stored under its name, next to what contributors return. Only a source
   // the run reads can clash, so an Extension may still contribute evidence under a builtin name.
   assertUniqueContributors(
@@ -188,10 +192,6 @@ export async function createScanSession(
     options.fetch,
     options.evidenceSourceCliFlags,
   );
-  if (options.affectedFiles && fullRunWhen?.(project)) {
-    options = { ...options, affectedFiles: undefined };
-    sessionBase.options = options;
-  }
   const registeredRules = new Map(registry.rules.map((rule) => [rule.meta.id, rule]));
   const ruleConfigs = resolveRuleConfigs(registeredRules, config.rules);
   const activations = resolveRulePackActivations(registry.packs, project);
@@ -257,7 +257,7 @@ export async function createScanSession(
       .map((pack) => ({
         name: pack.name,
         selected: selection.packs.has(pack),
-        activatedBy: reportedActivation(pack, project, activations.get(pack) ?? []),
+        activatedBy: activations.get(pack) ?? [],
       }))
       .filter((pack) => pack.selected || pack.activatedBy.length),
     ruleConfigs,
@@ -383,55 +383,82 @@ export function resolveProjectDoctorConfig(
 export async function resolveDoctorExtensions(
   inputs: readonly DoctorExtensionInput[],
 ): Promise<DoctorExtension[]> {
+  return (await resolveExtensionRegistrations(inputs, [])).map(({ extension }) => extension);
+}
+
+export async function resolveExtensionRegistrations(
+  inputs: readonly DoctorExtensionInput[],
+  configInputs: readonly DoctorExtensionInput[],
+) {
   const loaded = await Promise.all(
-    inputs.map(async (input) => {
-      if (typeof input !== "function") return input;
-      const value = await input();
-      return "default" in value ? value.default : value;
+    [...configInputs, ...inputs].map(async (input, index) => {
+      const fromConfig = index < configInputs.length;
+      try {
+        if (typeof input !== "function") return { extension: input, fromConfig };
+        const value = await input();
+        return { extension: "default" in value ? value.default : value, fromConfig };
+      } catch (error) {
+        throw attributePackError(error, fromConfig);
+      }
     }),
   );
   const names = new Set<string>();
-  return loaded.filter((extension) => {
+  return loaded.filter(({ extension }) => {
     if (names.has(extension.name)) return false;
     names.add(extension.name);
     return true;
   });
 }
 
-export async function collectRulePacks(inputs: readonly DoctorExtensionInput[]): Promise<{
-  packs: RulePack[];
-  rules: DoctorRule[];
-  inventoryContributors: ProjectInventoryContributor[];
-  runtimeEvidenceContributors: RuntimeEvidenceContributor[];
-  sources: EvidenceSource[];
-}> {
-  const extensions = await resolveDoctorExtensions(inputs);
-  const registeredPacks: RulePack[] = [];
+function attributePackError(error: unknown, fromConfig: boolean): unknown {
+  return fromConfig && error instanceof RemovedRuntimeEvidenceActivationError
+    ? new RemovedRuntimeEvidenceActivationError(error.message, true, { cause: error })
+    : error;
+}
+
+export async function collectRulePacks(
+  inputs: readonly DoctorExtensionInput[],
+  configInputs: readonly DoctorExtensionInput[] = [],
+): Promise<RuleRegistry> {
+  const extensions = await resolveExtensionRegistrations(inputs, configInputs);
+  const registeredPacks: Array<{ pack: RulePack; fromConfig: boolean }> = [];
   const inventoryContributors: ProjectInventoryContributor[] = [];
   const runtimeEvidenceContributors: RuntimeEvidenceContributor[] = [];
-  for (const extension of extensions) {
-    await extension.setup?.({
-      registerRulePack(pack) {
-        registeredPacks.push(pack);
-      },
-      registerProjectInventoryContributor(contributor) {
-        inventoryContributors.push({
-          name: contributor.name,
-          contribute: contributor.contribute.bind(contributor),
-        });
-      },
-      registerRuntimeEvidenceContributor(contributor) {
-        runtimeEvidenceContributors.push({
-          name: contributor.name,
-          contribute: contributor.contribute.bind(contributor),
-        });
-      },
-    });
+  for (const { extension, fromConfig } of extensions) {
+    try {
+      await extension.setup?.({
+        registerRulePack(pack) {
+          registeredPacks.push({ pack, fromConfig });
+        },
+        registerProjectInventoryContributor(contributor) {
+          inventoryContributors.push({
+            name: contributor.name,
+            contribute: contributor.contribute.bind(contributor),
+          });
+        },
+        registerRuntimeEvidenceContributor(contributor) {
+          runtimeEvidenceContributors.push({
+            name: contributor.name,
+            contribute: contributor.contribute.bind(contributor),
+          });
+        },
+      });
+    } catch (error) {
+      throw attributePackError(error, fromConfig);
+    }
   }
   const packs = [
-    ...extensions.flatMap((extension) => extension.rulePacks ?? []),
+    ...extensions.flatMap(({ extension, fromConfig }) =>
+      (extension.rulePacks ?? []).map((pack) => ({ pack, fromConfig })),
+    ),
     ...registeredPacks,
-  ].map((pack) => defineRulePack(pack));
+  ].map(({ pack, fromConfig }) => {
+    try {
+      return defineRulePack(pack);
+    } catch (error) {
+      throw attributePackError(error, fromConfig);
+    }
+  });
   const names = new Set<string>();
   const codes = new Set<string>();
   for (const pack of packs) {
@@ -443,9 +470,10 @@ export async function collectRulePacks(inputs: readonly DoctorExtensionInput[]):
     }
   }
   assertUniqueContributors(inventoryContributors, "Project Inventory");
-  const sources = extensions.flatMap((extension) => extension.sources ?? []);
+  const sources = extensions.flatMap(({ extension }) => extension.sources ?? []);
   assertEvidenceSourceNames(sources);
   assertUniqueContributors(sources, "Runtime Evidence");
+  assertUniqueContributors(runtimeEvidenceContributors, "Runtime Evidence");
   return {
     packs,
     rules: packs.flatMap((pack) => pack.rules),
@@ -506,6 +534,15 @@ function selectRules(
     ?.split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+  for (const pattern of wanted ?? []) {
+    if (
+      retiredRuleIds.has(pattern) ||
+      (Array.from(retiredRuleIds).some((ruleId) => nativeMatch(ruleId, pattern)) &&
+        !registry.rules.some((rule) => nativeMatch(rule.meta.id, pattern)))
+    ) {
+      throw new Error(`Cannot select Rules with "${pattern}": ${retiredRuleReason}.`);
+    }
+  }
 
   const workspaceRoots = projectWorkspacePackages(project).map((item) => item.root);
   const explicitFramework = options.framework !== undefined && options.framework !== "auto";
@@ -615,27 +652,7 @@ function resolveRulePackActivations(
   packs: readonly RulePack[],
   project: ProjectInfo,
 ): Map<RulePack, string[]> {
-  const activations = new Map(
-    packs.map((pack) => [pack, activatingWorkspacePackages(pack, project)]),
-  );
-  if (!project.noProject) return activations;
-  // Without a project, Runtime Evidence such as an MCP server's tools/list is what the run checks,
-  // so the fallback framework's Rule Packs do not activate beside it.
-  const byEvidence = packs.filter((pack) => runtimeEvidenceActivation(pack, project));
-  if (!byEvidence.length) return activations;
-  for (const pack of packs) if (!byEvidence.includes(pack)) activations.set(pack, []);
-  return activations;
-}
-
-/**
- * What a report names as having activated `pack`. Activation stays keyed by workspace root, since
- * Rule scopes come from it, but a run without a project has no root worth naming: the Runtime
- * Evidence that activated the pack, such as an MCP server's origin, is the honest source.
- */
-function reportedActivation(pack: RulePack, project: ProjectInfo, roots: string[]): string[] {
-  if (!project.noProject || !roots.length) return roots;
-  const sources = runtimeEvidenceActivation(pack, project);
-  return sources?.length ? [...sources] : roots;
+  return new Map(packs.map((pack) => [pack, activatingWorkspacePackages(pack, project)]));
 }
 
 function workspacePackageActivations(
@@ -790,6 +807,8 @@ function resolveRuleConfigs(
       resolved.set(ruleId, { enabled: false });
       continue;
     }
+    if (retiredRuleIds.has(ruleId))
+      throw doctorInternalDiagnostics.DOC0020({ ruleId, reason: retiredRuleReason });
     if (isSeverity(value)) {
       registeredRules.get(ruleId)?.validateOptions?.(undefined);
       resolved.set(ruleId, { enabled: true, severity: value });

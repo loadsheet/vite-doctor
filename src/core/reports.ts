@@ -9,7 +9,6 @@ import type {
   DoctorReportFormat,
   DoctorRunResult,
   DoctorSeverity,
-  LiveTargetGroup,
   FixSafety,
   RulePack,
 } from "./primitives.js";
@@ -216,35 +215,6 @@ function evidenceKey(item: DiagnosticEvidence): string {
     item.range && [item.range.start, item.range.end, item.range.line, item.range.column],
     item.relatedId,
   ]);
-}
-
-/**
- * Without a project, the live targets are the run's subject rather than a fallback framework.
- */
-function liveSubject(result: DoctorRunResult): LiveTargetGroup[] | undefined {
-  if (!result.project.noProject) return undefined;
-  const groups = new Map<string, LiveTargetGroup>();
-  for (const { name, label, targets } of [
-    ...(result.evidenceSources ?? []),
-    ...(result.contributedLiveTargets ?? []),
-  ]) {
-    if (!targets.length) continue;
-    const group = groups.get(name);
-    groups.set(name, {
-      name,
-      label: group?.label ?? label,
-      targets: [...new Set([...(group?.targets ?? []), ...targets])],
-    });
-  }
-  return groups.size ? [...groups.values()] : undefined;
-}
-
-function subjectTargets(subject: LiveTargetGroup[]) {
-  return {
-    live: subject.flatMap(({ name, targets }) =>
-      targets.map((target) => ({ source: name, target })),
-    ),
-  };
 }
 
 /** Diagnostic Codes with their counts, in report order. */
@@ -503,20 +473,9 @@ function textLayout(
 function textHead(result: DoctorRunResult, groups: ReportGroup[]): string[] {
   const lines: string[] = [];
   const status = reportStatus(result);
-  const subject = liveSubject(result);
-  if (subject) {
-    const checked = subject.map(
-      ({ label, targets }) => `${label}${targets.length === 1 ? "" : "s"} ${targets.join(", ")}`,
-    );
-    lines.push(`Checked: ${checked.join("; ")}`);
-    lines.push(`Project: none, ${result.root} has no package.json`);
-  } else {
-    lines.push(`Detected: ${frameworkLabel(result)}`);
-    lines.push(`Project: ${result.root}`);
-  }
-  if (status === "incomplete") {
-    lines.push("Status: incomplete, required evidence is missing");
-  }
+  lines.push(`Detected: ${frameworkLabel(result)}`);
+  lines.push(`Project: ${result.root}`);
+  if (status === "incomplete") lines.push("Status: incomplete, required evidence is missing");
   for (const gap of result.project.evidenceGaps ?? []) {
     lines.push(
       `Evidence missing: ${gap.message}${gap.files.length ? ` ${gap.files.join(", ")}` : ""}`,
@@ -619,15 +578,13 @@ function isEvidenceBacked(confidence: Confidence) {
 }
 
 export function createJsonReport(result: DoctorRunResult): string {
-  const subject = liveSubject(result);
   return `${JSON.stringify(
     {
       version: result.version,
       reportVersion: result.reportVersion ?? 4,
       fingerprintScheme: FINGERPRINT_SCHEME,
       status: reportStatus(result),
-      subject: subject && subjectTargets(subject),
-      framework: subject ? null : result.framework,
+      framework: result.framework,
       root: result.root,
       scope: result.scope,
       summary: result.summary,
@@ -649,7 +606,7 @@ export function createJsonReport(result: DoctorRunResult): string {
         label,
         targets,
       })),
-      workspacePackages: subject ? undefined : result.workspacePackages,
+      workspacePackages: result.workspacePackages,
       evidenceGaps: result.project.evidenceGaps,
       evidenceUsed: result.project.evidenceUsed,
       runtimeGraph: result.project.runtimeGraph,
@@ -675,7 +632,6 @@ function agentLayout(
 ): ProgressiveLayout {
   const status = reportStatus(result);
   const plugin = context.surface === "plugin";
-  const subject = liveSubject(result);
   const commandArgs = plugin
     ? undefined
     : {
@@ -683,7 +639,8 @@ function agentLayout(
           "vite-doctor",
           "explain",
           "<code>",
-          ...(subject ? [] : ["--framework", agentFramework(result, context)]),
+          "--framework",
+          agentFramework(result, context),
           ...(context.configFile ? ["--config", context.configFile] : []),
           ...(context.runOptions?.hostExtensions ? ["--host-extensions"] : []),
           "--format",
@@ -717,14 +674,11 @@ function agentLayout(
     `${JSON.stringify({
       schema: "vite-doctor.agent/v3",
       status,
-      subject: subject && subjectTargets(subject),
-      project: subject
-        ? null
-        : {
-            cwd: result.root,
-            framework: result.framework,
-            workspacePackages: result.workspacePackages,
-          },
+      project: {
+        cwd: result.root,
+        framework: result.framework,
+        workspacePackages: result.workspacePackages,
+      },
       rulePacks: result.rulePacks,
       scope: result.scope,
       summary: result.summary,
@@ -1197,9 +1151,7 @@ function runArguments(
   context: DoctorReportContext,
   command: RunCommand,
 ): string[] {
-  const args = liveSubject(result)
-    ? ["vite-doctor", command.root ?? result.root]
-    : ["vite-doctor", command.root ?? ".", "--framework", agentFramework(result, context)];
+  const args = ["vite-doctor", command.root ?? ".", "--framework", agentFramework(result, context)];
   if (result.scope.mode === "changed") {
     if (result.scope.base) args.push("--since", result.scope.base);
     else args.push("--changed");

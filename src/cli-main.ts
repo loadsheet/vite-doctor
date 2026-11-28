@@ -21,17 +21,14 @@ import {
   type DoctorPresentation,
 } from "./core/internal/agent-runtime.js";
 import { applyDoctorOptions, stringFlag } from "./core/internal/cli.js";
-import {
-  evidenceSourceFlags,
-  evidenceSourceInputs,
-  validateEvidenceSources,
-} from "./core/internal/evidence-sources.js";
+import { evidenceSourceFlags, evidenceSourceInputs } from "./core/internal/evidence-sources.js";
+import type { prepareViteDoctorEvidenceSources } from "./doctor.js";
 import { githubAnnotations } from "./core/internal/github-annotations.js";
 import { readViteConfigDoctor } from "./core/internal/vite-config-doctor.js";
 import { findViteConfigFile } from "./core/internal/vite-config-file.js";
+import { RemovedRuntimeEvidenceActivationError } from "./core/primitives.js";
 import type { DoctorProcessStatus } from "./doctor-process/client.js";
 import { DOCTOR_PROCESS_ENV } from "./doctor-process/protocol.js";
-import { builtinEvidenceSources } from "./builtin-sources.js";
 import { viteDoctorVersion } from "./version.js";
 
 type MetadataReportFormat = Exclude<DoctorReportFormat, "sarif">;
@@ -48,8 +45,6 @@ const frameworks = new Set<NonNullable<DoctorRunOptions["framework"]>>([
 ]);
 const severities = new Set<NonNullable<DoctorRunOptions["severity"]>>(["error", "warn", "info"]);
 const analyses = new Set(["dead-code", "graph", "dupes", "health"]);
-const builtinSourceFlags = evidenceSourceFlags(builtinEvidenceSources);
-const builtinSourceFlagNames = new Set(builtinSourceFlags.map(({ flag }) => flag));
 const sourceArgumentBoundary = "--doctorSourceArgument=1";
 
 class CliConfigError extends Error {
@@ -130,9 +125,8 @@ export async function main(
       applyDoctorOptions(runOptions, options);
       applyHostExtensions(runOptions, surface, options);
       validateCliRunOptions(runOptions);
-      runOptions.config = await loadCliConfig(cwd, stringFlag(options.config));
-      const { viteDoctorRulePacks } = await import("./doctor.js");
-      process.stdout.write(createRulesReport(await viteDoctorRulePacks(runOptions), format));
+      const packs = await loadCliRulePacks(cwd, stringFlag(options.config), runOptions);
+      process.stdout.write(createRulesReport(packs, format));
     });
   cli
     .command("explain <diagnostic>", "Explain a Doctor Diagnostic Code or Rule.")
@@ -146,9 +140,8 @@ export async function main(
       applyDoctorOptions(runOptions, options);
       applyHostExtensions(runOptions, surface, options);
       validateCliRunOptions(runOptions);
-      runOptions.config = await loadCliConfig(cwd, stringFlag(options.config));
-      const { viteDoctorRulePacks } = await import("./doctor.js");
-      const report = explainRule(await viteDoctorRulePacks(runOptions), diagnostic, format);
+      const packs = await loadCliRulePacks(cwd, stringFlag(options.config), runOptions);
+      const report = explainRule(packs, diagnostic, format);
       if (!report) {
         await writeCliError(`Unknown Diagnostic Code or Rule: ${diagnostic}`, format);
         exitCode = 2;
@@ -330,7 +323,7 @@ function splitEvidenceSourceArgs(
   for (const command of [cli.globalCommand, ...cli.commands]) {
     for (const option of command.options) {
       for (const flag of option.rawName.split(/[,\s]+/)) {
-        if (flag.startsWith("-") && !builtinSourceFlagNames.has(flag)) reserved.add(flag);
+        if (flag.startsWith("-")) reserved.add(flag);
       }
     }
   }
@@ -367,13 +360,10 @@ function unknownOption(flag: string): Error {
   return new Error(`Unknown option \`${flag}\``);
 }
 
-async function prepareEvidenceSourceRun(
-  options: DoctorRunOptions,
+function applyEvidenceSourceArgs(
+  { sources, runOptions }: Awaited<ReturnType<typeof prepareViteDoctorEvidenceSources>>,
   { reserved, source }: EvidenceArgs,
-): Promise<DoctorRunOptions | undefined> {
-  if (!source.size && !options.config?.extensions?.length && !options.hostExtensions) return;
-  const { prepareViteDoctorEvidenceSources } = await import("./doctor.js");
-  const { sources, runOptions } = await prepareViteDoctorEvidenceSources(options);
+) {
   const declarations = evidenceSourceFlags(sources);
   const known = new Set<string>();
   for (const { flag, source: owner } of declarations) {
@@ -384,11 +374,11 @@ async function prepareEvidenceSourceRun(
     known.add(flag);
   }
   for (const flag of source.keys()) if (!known.has(flag)) throw unknownOption(flag);
-  const inputs = evidenceSourceInputs(
-    declarations.filter(({ source }) => !builtinEvidenceSources.includes(source)),
-    source,
-  );
-  if (inputs) runOptions.sources = { ...runOptions.sources, ...inputs };
+  const inputs = evidenceSourceInputs(declarations, source);
+  if (inputs) {
+    runOptions.sources = { ...runOptions.sources, ...inputs };
+    runOptions.evidenceSourceCliFlags = source;
+  }
   return runOptions;
 }
 
@@ -463,13 +453,6 @@ function addDoctorRunCommand(
       validateCliRunOptions(runOptions);
       validateReportBudget(options, format);
       const parsedEvidenceArgs = evidenceArgs();
-      const builtinInputs = evidenceSourceInputs(builtinSourceFlags, parsedEvidenceArgs.source);
-      if (parsedEvidenceArgs.source.size)
-        runOptions.evidenceSourceCliFlags = parsedEvidenceArgs.source;
-      if (builtinInputs) {
-        await validateEvidenceSources(builtinEvidenceSources, builtinInputs);
-        runOptions.sources = builtinInputs;
-      }
       const report = {
         cwd,
         formatFlag: stringFlag(options.format) as DoctorReportFormat,
@@ -484,16 +467,38 @@ function addDoctorRunCommand(
       if (declarative?.file === resolve(root, "doctor.config.json")) {
         runOptions.declarativeConfigFile = declarative.file;
       }
-      const run = async () => {
-        try {
-          const prepared = await prepareEvidenceSourceRun(runOptions, parsedEvidenceArgs);
-          return await runDoctorCommand(runOptions, format, explicitConfig, report, prepared);
-        } catch (error) {
-          if (configFile && isLoadedConfigValidationError(error, runOptions)) {
-            throw createCliConfigError(configFile, error);
-          }
-          throw error;
+      const attributeConfigError = (error: unknown) => {
+        if (configFile && isLoadedConfigValidationError(error, runOptions)) {
+          return createCliConfigError(configFile, error);
         }
+        return error;
+      };
+      let preparation:
+        | { prepared: Awaited<ReturnType<typeof prepareViteDoctorEvidenceSources>> }
+        | { error: unknown }
+        | undefined;
+      if (
+        parsedEvidenceArgs.source.size ||
+        runOptions.config?.extensions?.length ||
+        runOptions.hostExtensions
+      ) {
+        const { prepareViteDoctorEvidenceSources } = await import("./doctor.js");
+        preparation = await prepareViteDoctorEvidenceSources(runOptions).then(
+          (prepared) => ({ prepared }),
+          (error: unknown) => ({ error: attributeConfigError(error) }),
+        );
+      }
+      const prepared =
+        preparation && "prepared" in preparation
+          ? applyEvidenceSourceArgs(preparation.prepared, parsedEvidenceArgs)
+          : undefined;
+      const run = async () => {
+        if (preparation && "error" in preparation) throw preparation.error;
+        return runDoctorCommand(runOptions, format, explicitConfig, report, prepared).catch(
+          (error: unknown) => {
+            throw attributeConfigError(error);
+          },
+        );
       };
       if (options.watch) {
         const initialRun = () => run().catch((error: unknown) => reportCliError(args, error));
@@ -505,8 +510,6 @@ function addDoctorRunCommand(
   // cac defaults negated flags to true, which renders as `(default: true)` on `--no-cache`
   // and makes every run look like an explicit `--cache` in rerun commands.
   for (const option of command.options) if (option.negated) option.config.default = undefined;
-  for (const { flag, definition } of builtinSourceFlags)
-    command.option(`${flag} <${definition.value ?? "value"}>`, definition.help);
 }
 
 async function watchDoctorCommand(
@@ -584,6 +587,27 @@ async function loadCliConfig(
     }
   }
   return declarativeConfig(root)?.config;
+}
+
+async function loadCliRulePacks(
+  root: string,
+  explicitConfig: string | undefined,
+  options: DoctorRunOptions,
+) {
+  options.config = await loadCliConfig(root, explicitConfig);
+  const { viteDoctorRulePacks } = await import("./doctor.js");
+  try {
+    return await viteDoctorRulePacks(options);
+  } catch (error) {
+    if (
+      explicitConfig &&
+      error instanceof RemovedRuntimeEvidenceActivationError &&
+      error.fromConfig
+    ) {
+      throw createCliConfigError(resolve(root, explicitConfig), error);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -781,6 +805,7 @@ function errorCode(error: unknown): string | undefined {
 }
 
 function isLoadedConfigValidationError(error: unknown, options: DoctorRunOptions): boolean {
+  if (error instanceof RemovedRuntimeEvidenceActivationError) return error.fromConfig;
   if (!(error instanceof Error)) return false;
   if ("doctorConfigOverride" in error && error.doctorConfigOverride === true) return true;
   if (error.name === "DOC0019" || error.name === "DOC0020" || error.name === "DOC0035") return true;

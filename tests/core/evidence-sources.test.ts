@@ -276,9 +276,26 @@ test("watch retries a failed initial Extension load", async () => {
   expect(readFileSync(generated, "utf8")).toBe("used");
 });
 
-test("an incomplete live-only text report does not blame a healthy source", async () => {
+test("watch rejects a missing Evidence Source flag value before watching", async () => {
   const root = project();
-  rmSync(join(root, "package.json"));
+  configWithSource(root);
+  const watchRuns = vi.spyOn(watch, "watchDoctorRuns").mockResolvedValue(0);
+  const { code, output } = await cli(root, [
+    ".",
+    "--config",
+    "doctor.config.mjs",
+    "--watch",
+    "--status-url",
+    "--format",
+    "text",
+  ]);
+  expect(code, output).toBe(2);
+  expect(output).toContain("--status-url requires a value.");
+  expect(watchRuns).not.toHaveBeenCalled();
+});
+
+test("an incomplete text report does not blame a healthy source", async () => {
+  const root = project();
   const result = await runViteDoctor({
     root,
     extensions: [
@@ -301,7 +318,7 @@ test("an incomplete live-only text report does not blame a healthy source", asyn
     fetch: fetchStatus(200),
   });
   const text = createTextReport(result);
-  expect(text).toContain("Checked: status page status.example.test");
+  expect(text).toContain(`Project: ${root}`);
   expect(text).toContain("Status: incomplete, required evidence is missing\n");
   expect(text).toContain("Evidence missing: Inventory unavailable.");
 });
@@ -500,7 +517,7 @@ test("an unknown flag stays an error without a config", async () => {
   expect(output).toContain("Unknown option `--chnaged`");
 });
 
-test("the core and the CLI entry reach MCP only through its Evidence Source", () => {
+test("the core and the CLI entry do not implement live MCP checks", () => {
   const src = join(import.meta.dirname, "../../src");
   const files = [
     ...readdirSync(join(src, "core"), { recursive: true, encoding: "utf8" })

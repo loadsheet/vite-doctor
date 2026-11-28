@@ -119,14 +119,10 @@ export async function collectEvidenceSources(
       args: sourceArgs(source, input, cliFlags),
     };
   }
-  const earlyRuns = new Map<string, EvidenceSourceRun>();
-  for (const { source, input } of requested) {
-    if (source.beforeRuntimeEvidence) earlyRuns.set(source.name, await collect(source, input));
-  }
   await contributeRuntimeEvidence();
   const runs: EvidenceSourceRun[] = [];
   for (const { source, input } of requested) {
-    runs.push(earlyRuns.get(source.name) ?? (await collect(source, input)));
+    runs.push(await collect(source, input));
   }
   return runs;
 }
@@ -136,9 +132,11 @@ function sourceArgs(
   input: unknown,
   cliFlags: DoctorRunOptions["evidenceSourceCliFlags"],
 ): string[] {
-  const values = source.toOptions?.(input);
-  return evidenceSourceFlags([source]).flatMap(({ option, definition, flag }) =>
-    (values ? (values[option] ?? []) : (cliFlags?.get(flag) ?? [])).flatMap((value) => {
+  const parsedFlags = evidenceSourceFlags([source]);
+  const fromCli = parsedFlags.some(({ flag }) => cliFlags?.has(flag));
+  const values = fromCli ? undefined : source.toOptions?.(input);
+  return parsedFlags.flatMap(({ option, definition, flag }) =>
+    (fromCli ? (cliFlags?.get(flag) ?? []) : (values?.[option] ?? [])).flatMap((value) => {
       const displayed = redact(definition, value);
       return displayed.startsWith("-") ? [`${flag}=${displayed}`] : [flag, displayed];
     }),

@@ -14,7 +14,7 @@ import {
 } from "./core/index.js";
 import {
   collectRulePacks,
-  resolveDoctorExtensions,
+  resolveExtensionRegistrations,
   resolveProjectDoctorConfig,
 } from "./core/internal/scan-session.js";
 import {
@@ -33,41 +33,41 @@ import designSystemRulePack from "./rule-packs/design-system/index.js";
 import { packageRulePack } from "./rule-packs/package/index.js";
 import { piniaRulePack } from "./rule-packs/pinia/index.js";
 import { mcpRulePack } from "./rule-packs/mcp/index.js";
-import {
-  mcpEvidenceSource,
-  mcpEvidenceUsed,
-  mcpServerLabels,
-  readMcpServers,
-  uncheckedMcpEvidenceGap,
-  unreadMcpServerGaps,
-} from "./mcp/evidence.js";
-import { checkedMcpServers } from "./rule-packs/mcp/rules/wire.js";
 import { viteDoctorVersion } from "./version.js";
 
 export async function viteDoctorRulePacks(options: DoctorRunOptions = {}) {
-  const registry = await collectRulePacks([
-    ...(options.config?.extensions ?? []),
-    ...(await viteDoctorExtensions(options)),
-    ...(options.extensions ?? []),
-    ...(await hostDoctorExtensions(options)),
-  ]);
+  const registry = await collectRulePacks(
+    [
+      ...(await viteDoctorExtensions(options)),
+      ...(options.extensions ?? []),
+      ...(await hostDoctorExtensions(options)),
+    ],
+    options.config?.extensions,
+  );
   return registry.packs;
 }
 
 export async function prepareViteDoctorEvidenceSources(options: DoctorRunOptions) {
   const runOptions = await viteDoctorRunOptions(options);
-  const extensions = await resolveDoctorExtensions([
-    ...(runOptions.config?.extensions ?? []),
-    ...(runOptions.extensions ?? []),
-  ]);
+  const extensions = await resolveExtensionRegistrations(
+    runOptions.extensions ?? [],
+    runOptions.config?.extensions ?? [],
+  );
   return {
-    sources: extensions.flatMap((extension) => extension.sources ?? []),
+    sources: extensions.flatMap(({ extension }) => extension.sources ?? []),
     runOptions: {
       ...runOptions,
       config: runOptions.config?.extensions
-        ? { ...runOptions.config, extensions: [] }
+        ? {
+            ...runOptions.config,
+            extensions: extensions
+              .filter(({ fromConfig }) => fromConfig)
+              .map(({ extension }) => extension),
+          }
         : runOptions.config,
-      extensions,
+      extensions: extensions
+        .filter(({ fromConfig }) => !fromConfig)
+        .map(({ extension }) => extension),
     },
   };
 }
@@ -91,7 +91,6 @@ export async function viteDoctorExtensions(
     defineDoctorExtension({
       name: "vite-doctor/builtin-mcp",
       rulePacks: [mcpRulePack],
-      sources: [mcpEvidenceSource],
     }),
   ];
   if (frameworks.has("nuxt")) {
@@ -122,39 +121,12 @@ export async function viteDoctorExtensions(
   }));
 }
 
-export async function runViteDoctor(options: DoctorRunOptions, fullRunForMcpEvidence = false) {
-  return runPreparedViteDoctor(await viteDoctorRunOptions(options), fullRunForMcpEvidence);
+export async function runViteDoctor(options: DoctorRunOptions) {
+  return runPreparedViteDoctor(await viteDoctorRunOptions(options));
 }
 
-export async function runPreparedViteDoctor(
-  options: DoctorRunOptions,
-  fullRunForMcpEvidence = false,
-) {
-  const result = await runDoctor(
-    options,
-    fullRunForMcpEvidence
-      ? (project) => readMcpServers(project.runtimeEvidence).length > 0
-      : undefined,
-  );
-  const { projectWide, scoped, clientLimits } = checkedMcpServers(result.project);
-  const used = [...mcpEvidenceUsed(projectWide), ...mcpEvidenceUsed(scoped, true)];
-  const mcpPackSelected = result.rulePacks?.some(
-    (pack) => pack.name === mcpRulePack.name && pack.selected,
-  );
-  const unchecked = !clientLimits && !mcpPackSelected && uncheckedMcpEvidenceGap(result.project);
-  const gaps = [...unreadMcpServerGaps(result.project), ...(unchecked ? [unchecked] : [])];
-  if (gaps.length) result.project.evidenceGaps = [...(result.project.evidenceGaps ?? []), ...gaps];
-  if (used.length) result.project.evidenceUsed = [...(result.project.evidenceUsed ?? []), ...used];
-  if (result.project.noProject) {
-    const { name, label } = mcpEvidenceSource;
-    const sourceTargets = new Set(
-      result.evidenceSources?.find((source) => source.name === name)?.targets,
-    );
-    const targets = mcpServerLabels(result.project.runtimeEvidence).filter(
-      (target) => !sourceTargets.has(target),
-    );
-    if (targets.length) result.contributedLiveTargets = [{ name, label, targets }];
-  }
+export async function runPreparedViteDoctor(options: DoctorRunOptions) {
+  const result = await runDoctor(options);
   return { ...result, version: viteDoctorVersion };
 }
 
