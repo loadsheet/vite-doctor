@@ -13,6 +13,8 @@ import {
   type DoctorExtensionInput,
   type DoctorRule,
   type DoctorSeverity,
+  type EvidenceSource,
+  type EvidenceSourceRun,
   type ProjectInventoryContributor,
   type ProjectInfo,
   type RuntimeEvidenceContributor,
@@ -25,6 +27,11 @@ import {
   type WorkspacePackageActivation,
 } from "../primitives.js";
 import { detectProject } from "./project.js";
+import {
+  assertEvidenceSourceNames,
+  collectEvidenceSources,
+  validateEvidenceSources,
+} from "./evidence-sources.js";
 import { workspaceProjectView, workspaceViewRoots } from "./workspace-nuxt.js";
 import {
   GitChangeUnavailableError,
@@ -65,6 +72,7 @@ interface RuleRegistry {
   rules: DoctorRule[];
   inventoryContributors: ProjectInventoryContributor[];
   runtimeEvidenceContributors: RuntimeEvidenceContributor[];
+  sources: EvidenceSource[];
 }
 
 export interface ScanSession {
@@ -107,6 +115,7 @@ export interface ScanSession {
   ruleScopes: Map<string, ReadonlySet<string>>;
   workspaceActivations: WorkspacePackageActivation[];
   rulePacks: RulePackActivation[];
+  evidenceSources: EvidenceSourceRun[];
   ruleConfigs: Map<string, ResolvedRuleConfig>;
   ruleOverrides: ResolvedRuleOverride[];
   /** Rules that run only on the files an override turns them on for. */
@@ -160,7 +169,29 @@ export async function createScanSession(options: DoctorRunOptions): Promise<Scan
     [...(fromConfig ? [] : (config.extensions ?? [])), ...(options.extensions ?? [])],
     fromConfig ? config.extensions : undefined,
   );
-  await applyProjectContributions(project, registry);
+  // A source's evidence is stored under its name, next to what contributors return. Only a source
+  // the run reads can clash, so an Extension may still contribute evidence under a builtin name.
+  assertUniqueContributors(
+    [
+      ...registry.runtimeEvidenceContributors,
+      ...registry.sources.filter(
+        ({ name }) =>
+          options.sources &&
+          Object.hasOwn(options.sources, name) &&
+          options.sources[name] !== undefined,
+      ),
+    ],
+    "Runtime Evidence",
+  );
+  const requestedSources = await validateEvidenceSources(registry.sources, options.sources);
+  await applyProjectInventory(project, registry);
+  const evidenceSources = await collectEvidenceSources(
+    project,
+    requestedSources,
+    () => applyRuntimeEvidence(project, registry),
+    options.fetch,
+    options.evidenceSourceCliFlags,
+  );
   const registeredRules = new Map(registry.rules.map((rule) => [rule.meta.id, rule]));
   const ruleConfigs = resolveRuleConfigs(registeredRules, config.rules);
   const activations = resolveRulePackActivations(registry.packs, project);
@@ -201,6 +232,7 @@ export async function createScanSession(options: DoctorRunOptions): Promise<Scan
     ...sessionBase,
     registry,
     project,
+    evidenceSources,
     files,
     testFiles: sourceInventory.testFiles,
     gitChanges: sourceInventory.git,
@@ -354,7 +386,7 @@ export async function resolveDoctorExtensions(
   return (await resolveExtensionRegistrations(inputs, [])).map(({ extension }) => extension);
 }
 
-async function resolveExtensionRegistrations(
+export async function resolveExtensionRegistrations(
   inputs: readonly DoctorExtensionInput[],
   configInputs: readonly DoctorExtensionInput[],
 ) {
@@ -438,12 +470,16 @@ export async function collectRulePacks(
     }
   }
   assertUniqueContributors(inventoryContributors, "Project Inventory");
+  const sources = extensions.flatMap(({ extension }) => extension.sources ?? []);
+  assertEvidenceSourceNames(sources);
+  assertUniqueContributors(sources, "Runtime Evidence");
   assertUniqueContributors(runtimeEvidenceContributors, "Runtime Evidence");
   return {
     packs,
     rules: packs.flatMap((pack) => pack.rules),
     inventoryContributors,
     runtimeEvidenceContributors,
+    sources,
   };
 }
 
@@ -460,14 +496,14 @@ function assertUniqueContributors(
   }
 }
 
-async function applyProjectContributions(
-  project: ProjectInfo,
-  registry: RuleRegistry,
-): Promise<void> {
+async function applyProjectInventory(project: ProjectInfo, registry: RuleRegistry): Promise<void> {
   for (const contributor of registry.inventoryContributors) {
     const contribution = await contributor.contribute(project);
     project.inventory = { ...project.inventory, [contributor.name]: contribution };
   }
+}
+
+async function applyRuntimeEvidence(project: ProjectInfo, registry: RuleRegistry): Promise<void> {
   for (const contributor of registry.runtimeEvidenceContributors) {
     const contribution = await contributor.contribute(project);
     project.runtimeEvidence = { ...project.runtimeEvidence, [contributor.name]: contribution };

@@ -88,6 +88,10 @@ _Avoid_: Screen, page (a page is one file of a View)
 Facts about which runtime your code runs in (client, server, build, or a framework runtime), collected from your own toolchain: the Vite or Nuxt process a Plugin Surface runs inside, a finished build, or a Doctor Extension. Doctor opens no connection to a server. Checking a running or deployed server by URL is loadsheet's job, not Doctor's.
 _Avoid_: Context, environment, live server checks
 
+**Evidence Source**:
+Runtime Evidence a Doctor Extension reads from outside the source tree, such as a toolchain report, only when the Doctor Run passes it an input. It declares its CLI flags as data rather than registering them during setup.
+_Avoid_: Scanner, integration, adapter
+
 **Build Evidence**:
 Runtime Evidence that the Vite Plugin Surface collects from a finished `vite build`: each environment's consumer, its output chunks with their module ids, and Vite's importers for each module.
 _Avoid_: Bundle stats, build manifest
@@ -141,6 +145,7 @@ _Avoid_: Agent surface
 - A **Doctor** contains one or more **Rule Packs**.
 - A **Doctor Extension** contributes capabilities to a **Doctor**.
 - A **Doctor Extension** can contribute **Project Inventory** and **Runtime Evidence**.
+- A **Doctor Extension** can declare **Evidence Sources**; a **Doctor Run** reads one only when it is given an input for it.
 - A **Doctor Run** executes a **Doctor** against one project.
 - A **Rule Pack** contains one or more **Rules**.
 - A **Rule Pack** can define one or more **Presets**.

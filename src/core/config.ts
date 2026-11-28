@@ -61,6 +61,15 @@ export interface DoctorRunOptions {
   hostExtensions?: boolean;
   runtimeTarget?: RuntimeTarget;
   /**
+   * Inputs for Evidence Sources, keyed by source name. A source without an input is not read.
+   * Inputs can carry tokens, so they stay out of Doctor config files.
+   */
+  sources?: Record<string, unknown>;
+  /** @internal Parsed Evidence Source flags for reruns when a source cannot serialize its input. */
+  evidenceSourceCliFlags?: ReadonlyMap<string, readonly string[]>;
+  /** `fetch` for Evidence Sources, `globalThis.fetch` when unset. */
+  fetch?: typeof globalThis.fetch;
+  /**
    * Project Inventory from `detectProject` for this root. The run reuses it instead of detecting
    * the project, so `framework` and `runtimeTarget` no longer apply. Doctor Extension inventory
    * and Runtime Evidence contributors still run.

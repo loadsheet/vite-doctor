@@ -5,6 +5,7 @@ import type {
   Confidence,
   Diagnostic,
   DiagnosticEvidence,
+  DiagnosticOrigin,
   DoctorReportFormat,
   DoctorRunResult,
   DoctorSeverity,
@@ -20,6 +21,7 @@ import { codeForRuleId } from "./diagnostics.js";
 import { diagnosticMetadataByCode, diagnosticMetadataByRuleId } from "./diagnostic-metadata.js";
 import type { DoctorRunOptions } from "./config.js";
 import { shellArgument } from "./internal/utils.js";
+import { REDACTED } from "./internal/evidence-sources.js";
 import { unresolvedRuntimeInventory } from "./internal/runtime-packages.js";
 import { defaultReportBudget, type ReportReader } from "./internal/agent-runtime.js";
 import { scoreDiagnostics } from "./internal/scoring.js";
@@ -115,6 +117,7 @@ function textDiagnosticBlock(
     `    rule: ${diagnostic.ruleId}`,
     `    source: ${source}`,
     ...(diagnostic.confidence ? [`    confidence: ${diagnostic.confidence}`] : []),
+    ...(diagnostic.origin ? [`    origin: ${originSummary(diagnostic.origin)}`] : []),
     ...(diagnostic.evidence ?? [])
       .filter((item) => !shared.has(evidenceKey(item)))
       .map((item) => `    evidence: ${item.kind}: ${item.summary}`),
@@ -125,6 +128,26 @@ function textDiagnosticBlock(
 export function diagnosticLocation(root: string, diagnostic: Diagnostic): string {
   const path = relative(root, diagnostic.file) || ".";
   return diagnostic.range ? `${path}:${diagnostic.range.line}:${diagnostic.range.column}` : path;
+}
+
+type OriginTag = "code" | "code+live" | "live";
+
+/** Whether the source, a live target such as a deployed server, or both showed the Diagnostic. */
+function originTag(diagnostic: Diagnostic): OriginTag {
+  if (!diagnostic.origin?.live?.length) return "code";
+  return diagnostic.origin.code === "found" ? "code+live" : "live";
+}
+
+const SOURCE_STATES: Record<DiagnosticOrigin["code"], string> = {
+  found: "the source has it too",
+  passes: "the source passes the static check; check the deployment and runtime configuration",
+  "not-checked": "the source was not verified",
+  "no-definition": "no unique source definition matched",
+};
+
+function originSummary(origin: DiagnosticOrigin): string {
+  const live = origin.live?.map((target) => target.target).join(", ");
+  return live ? `live at ${live}; ${SOURCE_STATES[origin.code]}` : SOURCE_STATES[origin.code];
 }
 
 function isLocated(root: string, diagnostic: Diagnostic): boolean {
@@ -319,6 +342,7 @@ function textLayout(
     : { more: command({ rules: null }), full: command({ full: true }) };
   const plural = (count: number, noun: string) =>
     `${count.toLocaleString("en-US")} ${noun}${count === 1 ? "" : "s"}`;
+  const tagged = result.diagnostics.some((diagnostic) => diagnostic.origin?.live?.length);
   const footer = (hidden: BudgetHidden, hiddenCodes: number): string[] => {
     if (!hasHidden(hidden)) return [];
     const limit = `(limit ${plural(maxChars, "character")}).`;
@@ -330,7 +354,11 @@ function textLayout(
       "",
       first,
       ...(commands
-        ? [`One group: ${commands.more} plus its "more:" flags`, `Everything: ${commands.full}`]
+        ? [
+            `One group: ${commands.more} plus its "more:" flags`,
+            `Everything: ${commands.full}`,
+            ...(commands.full.includes(REDACTED) ? [REDACTED_NOTE] : []),
+          ]
         : [
             "More: apply the group's options, or set maxChars: Infinity in the Doctor plugin options",
           ]),
@@ -369,11 +397,13 @@ function textLayout(
     const width = Math.min(48, Math.max(...labels.map((label) => label.length)));
     const rows = group.diagnostics.map((diagnostic, row) => {
       const safety = diagnostic.fix ? ` · ${fixSafetyLabel(diagnostic.fix.kind)}` : "";
+      const deployment = diagnostic.origin?.code === "passes" ? " · check deployment" : "";
+      const tag = tagged ? `${originTag(diagnostic).padEnd(9)}  ` : "";
       const text = (diagnostic.brief ?? diagnostic.why).replaceAll(
         "\n",
-        `\n${" ".repeat(width + 4)}`,
+        `\n${" ".repeat(tag.length + width + 4)}`,
       );
-      return `  ${labels[row]!.padEnd(width)}  ${text}${safety}`;
+      return `  ${tag}${labels[row]!.padEnd(width)}  ${text}${deployment}${safety}`;
     });
     const trailer = (hiddenRows: number, hint: GroupHint | undefined) => [
       ...(hiddenRows ? [`  (${plural(hiddenRows, "more row")})`] : []),
@@ -445,8 +475,7 @@ function textHead(result: DoctorRunResult, groups: ReportGroup[]): string[] {
   const status = reportStatus(result);
   lines.push(`Detected: ${frameworkLabel(result)}`);
   lines.push(`Project: ${result.root}`);
-  if (status === "incomplete")
-    lines.push("Status: incomplete, required project evidence is missing");
+  if (status === "incomplete") lines.push("Status: incomplete, required evidence is missing");
   for (const gap of result.project.evidenceGaps ?? []) {
     lines.push(
       `Evidence missing: ${gap.message}${gap.files.length ? ` ${gap.files.join(", ")}` : ""}`,
@@ -572,6 +601,11 @@ export function createJsonReport(result: DoctorRunResult): string {
       graph: result.graph,
       extends: result.extends,
       rulePacks: result.rulePacks,
+      sources: result.evidenceSources?.map(({ name, label, targets }) => ({
+        name,
+        label,
+        targets,
+      })),
       workspacePackages: result.workspacePackages,
       evidenceGaps: result.project.evidenceGaps,
       evidenceUsed: result.project.evidenceUsed,
@@ -622,11 +656,20 @@ function agentLayout(
     Object.fromEntries(
       Object.entries(commandArgs).map(([name, args]) => [name, args.map(shellArgument).join(" ")]),
     );
+  const placeholders = commandArgs?.rerun.some((arg) => arg.includes(REDACTED))
+    ? { [REDACTED]: REDACTED_NOTE }
+    : undefined;
   const recovery = plugin
     ? "Rerun the host with the group's more options or pluginOptions.full (use numeric Infinity for maxChars)."
     : "To see what the Report Budget hid, append a group's more items to commandArgs.more, or use commandArgs.full when no more items are given.";
   const codes = codeIndex(groups);
   const total = result.diagnostics.length;
+  const live = result.diagnostics.filter((diagnostic) => diagnostic.origin?.live?.length);
+  const verifyLive = live.length ? " Verify live findings against the same target." : "";
+  const deployment = live.some((diagnostic) => diagnostic.origin?.code === "passes")
+    ? ' When origin.code is "passes", check the deployed version and runtime configuration before editing source or redeploying.'
+    : "";
+  const liveGuidance = verifyLive + deployment;
   const serialize = (budget: object | undefined, items: object[]) =>
     `${JSON.stringify({
       schema: "vite-doctor.agent/v3",
@@ -647,6 +690,7 @@ function agentLayout(
       evidenceUsed: result.project.evidenceUsed,
       commands,
       commandArgs,
+      placeholders,
       pluginOptions: plugin && budget ? { full: FULL_PLUGIN_OPTIONS } : undefined,
       next:
         status === "clean"
@@ -654,13 +698,14 @@ function agentLayout(
           : status === "incomplete"
             ? {
                 action: "restore-evidence",
-                instruction:
+                instruction: `${
                   result.project.evidenceGaps?.map((gap) => gap.message).join(" ") ||
-                  "Install project dependencies and run Doctor from the target package before relying on version-specific results.",
+                  "Install project dependencies and run Doctor from the target package before relying on version-specific results."
+                }${liveGuidance}`,
               }
             : {
                 action: "remediate",
-                instruction: `Apply the smallest remediation that resolves each owned diagnostic${plugin ? "" : ", run its focused verification"}, then rerun Doctor.${budget ? ` ${recovery}` : ""}`,
+                instruction: `Apply the smallest remediation that resolves each owned diagnostic${plugin ? "" : ", run its focused verification"}, then rerun Doctor.${liveGuidance}${budget ? ` ${recovery}` : ""}`,
               },
     })}\n`;
   const budgetField = (hidden: BudgetHidden) => ({ maxChars, hidden });
@@ -756,6 +801,7 @@ function agentRow(result: DoctorRunResult, diagnostic: Diagnostic) {
         ? agentLocation(result, diagnostic)
         : undefined,
     subject: diagnostic.subject,
+    origin: diagnostic.origin,
     ...(diagnostic.brief ? { brief: diagnostic.brief } : { message: diagnostic.why }),
     fixSafety: diagnostic.fix?.kind,
   };
@@ -766,6 +812,7 @@ function agentDetail(result: DoctorRunResult, diagnostic: Diagnostic) {
     fingerprint: diagnostic.fingerprint,
     location: agentLocation(result, diagnostic),
     subject: diagnostic.subject,
+    origin: diagnostic.origin,
     brief: diagnostic.brief,
     message: diagnostic.why,
     fixSafety: diagnostic.fix?.kind,
@@ -852,10 +899,16 @@ export function createSarifReport(result: DoctorRunResult): string {
                 ? diagnostic.evidence.map((item) => item.kind)
                 : undefined,
               analysisPhase: diagnostic.analysisPhase,
+              origin: diagnostic.origin,
               data: diagnostic.data,
             },
             locations: [
               {
+                // What a live target sent, such as an MCP tool, named beside where to fix it.
+                logicalLocations:
+                  diagnostic.origin?.live?.length && diagnostic.subject
+                    ? [{ name: diagnostic.subject, kind: "resource" }]
+                    : undefined,
                 physicalLocation: {
                   artifactLocation: { uri: sarifArtifactUri(result.root, diagnostic.file) },
                   region: diagnostic.range
@@ -1120,6 +1173,7 @@ function runArguments(
   ] as const) {
     if (value !== undefined) args.push(flag, String(value));
   }
+  for (const source of result.evidenceSources ?? []) args.push(...source.args);
   if (options?.newOnly) args.push("--new-only");
   if (options?.profile) args.push("--profile");
   if (options?.cache !== undefined) args.push(options.cache ? "--cache" : "--no-cache");
@@ -1127,6 +1181,9 @@ function runArguments(
   if (command.format) args.push("--format", command.format);
   return args;
 }
+
+const REDACTED_NOTE =
+  "Doctor redacts flag values that can carry secrets, such as tokens in headers or URLs. Replace each <redacted> with the value you ran with.";
 
 // Workspace runs derive Rule Packs from every workspace package, which pinning the resolved
 // framework would replace with that framework's packs alone.

@@ -12,7 +12,11 @@ import {
   type DoctorRunResult,
   type NuxtDoctorManifest,
 } from "./core/index.js";
-import { collectRulePacks, resolveProjectDoctorConfig } from "./core/internal/scan-session.js";
+import {
+  collectRulePacks,
+  resolveExtensionRegistrations,
+  resolveProjectDoctorConfig,
+} from "./core/internal/scan-session.js";
 import {
   detectWorkspacePackages,
   nuxtInventoryOwner,
@@ -43,6 +47,31 @@ export async function viteDoctorRulePacks(options: DoctorRunOptions = {}) {
   return registry.packs;
 }
 
+export async function prepareViteDoctorEvidenceSources(options: DoctorRunOptions) {
+  const runOptions = await viteDoctorRunOptions(options);
+  const extensions = await resolveExtensionRegistrations(
+    runOptions.extensions ?? [],
+    runOptions.config?.extensions ?? [],
+  );
+  return {
+    sources: extensions.flatMap(({ extension }) => extension.sources ?? []),
+    runOptions: {
+      ...runOptions,
+      config: runOptions.config?.extensions
+        ? {
+            ...runOptions.config,
+            extensions: extensions
+              .filter(({ fromConfig }) => fromConfig)
+              .map(({ extension }) => extension),
+          }
+        : runOptions.config,
+      extensions: extensions
+        .filter(({ fromConfig }) => !fromConfig)
+        .map(({ extension }) => extension),
+    },
+  };
+}
+
 export async function viteDoctorExtensions(
   options: DoctorRunOptions = {},
 ): Promise<DoctorExtension[]> {
@@ -59,7 +88,10 @@ export async function viteDoctorExtensions(
       rulePacks: [designSystemRulePack],
     }),
     defineDoctorExtension({ name: "vite-doctor/builtin-pinia", rulePacks: [piniaRulePack] }),
-    defineDoctorExtension({ name: "vite-doctor/builtin-mcp", rulePacks: [mcpRulePack] }),
+    defineDoctorExtension({
+      name: "vite-doctor/builtin-mcp",
+      rulePacks: [mcpRulePack],
+    }),
   ];
   if (frameworks.has("nuxt")) {
     const { nuxtDoctorExtensions } = await import("./rule-packs/nuxt/rules/index.js");
@@ -90,7 +122,11 @@ export async function viteDoctorExtensions(
 }
 
 export async function runViteDoctor(options: DoctorRunOptions) {
-  const result = await runDoctor(await viteDoctorRunOptions(options));
+  return runPreparedViteDoctor(await viteDoctorRunOptions(options));
+}
+
+export async function runPreparedViteDoctor(options: DoctorRunOptions) {
+  const result = await runDoctor(options);
   return { ...result, version: viteDoctorVersion };
 }
 
